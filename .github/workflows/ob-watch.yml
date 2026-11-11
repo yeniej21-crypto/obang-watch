@@ -1,0 +1,195 @@
+# 오방도감 바깥 감시 (넷리파이 밖 · 10분마다 · 가입 없음)
+# - 같은 폴더 맨 위의 watch.sh 를 돌린다(홈 · 처리방침 · 사이트맵 · /api/status · /api/health · 매일 백업 결과 · 결제 함수 · 대표 메뉴 5곳).
+# - 같은 항목이 3번 이어서 실패하면 그때 처음으로 이 실행을 '실패'로 표시하고(→ GitHub 기본 메일) issue 를 하나 연다.
+#   사이트: 그 뒤에도 안 나으면 6번(약 1시간)마다 한 번만 다시 실패로 표시. 1~2번 실패는 '주의'로만(메일 넘침 방지).
+#   백업(backup): 따로 센다. issue 는 하루(한국 날짜)에 한 번만 열고, 다시 실패 표시도 하루에 한 번(144번마다).
+# - 회복되면 issue 에 회복 댓글을 달고 닫는다. 슬랙 웹훅(secrets.OB_SLACK_P1)이 있으면 같은 때 슬랙에도 보낸다.
+# - 값(열쇠 · 웹훅)은 secrets 에만. 이 파일과 로그에는 이름만 나온다.
+name: ob-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: "1 = 일부러 실패 하나 만들기(알림 길 시험. 3번 이어 돌리면 issue 가 열림)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write   # 공개 저장소 60일 멈춤 막기(오래 커밋이 없을 때만 빈 커밋 하나)
+  issues: write
+  actions: read
+
+concurrency:
+  group: ob-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      BASE: https://obangdogam.com
+      OB_WATCH_STRICT: ${{ vars.OB_WATCH_STRICT }}         # 오픈 날 저장소 Variables 에 1 → 화면은 200 만 정상
+      OB_BACKUP_REQUIRED: ${{ vars.OB_BACKUP_REQUIRED }}   # 첫 백업 성공 뒤 1 → 백업 기록이 아예 없어도 실패
+      ALARM_AT: "3"
+      REMIND_SITE: "6"       # 사이트: 1시간마다 다시 알림
+      REMIND_BACKUP: "144"   # 백업: 하루마다 다시 알림
+      OUT_DIR: .ob-out
+      STATE_DIR: .ob-state
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 지난 기록 불러오기
+        uses: actions/cache/restore@v4
+        with:
+          path: .ob-state
+          key: ob-watch-state-${{ github.run_id }}
+          restore-keys: ob-watch-state-
+
+      - name: 점검
+        env:
+          OB_GATE_COOKIE: ${{ secrets.OB_GATE_COOKIE }}
+          OB_DRILL: ${{ github.event.inputs.drill || vars.OB_DRILL || '0' }}   # 저장소 Variables 에 OB_DRILL=1 을 30분 두면 issue · 메일 시험
+        run: bash watch.sh || true
+
+      - name: 이어진 실패 세기
+        id: d
+        run: |
+          mkdir -p "$STATE_DIR"
+          python3 - <<'PY'
+          import os, json, time
+          sd, od = os.environ["STATE_DIR"], os.environ["OUT_DIR"]
+          at = int(os.environ["ALARM_AT"])
+          every = {"site": int(os.environ["REMIND_SITE"]), "backup": int(os.environ["REMIND_BACKUP"])}
+          group = lambda n: "backup" if n == "backup" else "site"
+          try: prev = json.load(open(f"{sd}/state.json"))
+          except Exception: prev = {}
+          ps, pz = prev.get("streak", {}), prev.get("since", {})
+          fails = [l.strip() for l in open(f"{od}/fail_names") if l.strip()] if os.path.exists(f"{od}/fail_names") else []
+          now = int(time.time())
+          streak = {n: ps.get(n, 0) + 1 for n in fails}
+          since = {n: pz.get(n, now) for n in fails}
+          out = {}
+          for g in ("site", "backup"):
+              f = [n for n in fails if group(n) == g]
+              new = sorted(n for n in f if streak[n] == at)
+              rem = sorted(n for n in f if streak[n] > at and (streak[n] - at) % every[g] == 0)
+              act_ = sorted(n for n in f if streak[n] >= at)
+              rec = sorted(n for n, k in ps.items() if group(n) == g and k >= at and n not in streak)
+              a = "alarm" if new else "remind" if rem else "recover" if rec and not act_ else "ongoing" if act_ else "warn" if f else "ok"
+              down = min([pz.get(n, now) for n in rec] or [now])
+              out.update({f"{g}_act": a, f"{g}_active": ",".join(act_), f"{g}_new": ",".join(new),
+                          f"{g}_rec": ",".join(rec), f"{g}_downmin": str(round((now - down) / 60))})
+          out["changed"] = "1" if streak != ps else "0"
+          out["streaks"] = " ".join(f"{n}x{k}" for n, k in sorted(streak.items()))
+          json.dump({"streak": streak, "since": since}, open(f"{sd}/state.json", "w"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              for k, v in out.items(): fh.write(f"{k}={v}\n")
+          print(out)
+          PY
+          cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "판정: 사이트 $(grep '^site_act=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2) · 백업 $(grep '^backup_act=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 기록 남기기
+        if: steps.d.outputs.changed == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .ob-state
+          key: ob-watch-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: issue 열기 · 갱신 · 닫기
+        if: contains(fromJSON('["alarm","remind","recover"]'), steps.d.outputs.site_act) || contains(fromJSON('["alarm","remind","recover"]'), steps.d.outputs.backup_act)
+        env:
+          SITE_ACT: ${{ steps.d.outputs.site_act }}
+          SITE_ACTIVE: ${{ steps.d.outputs.site_active }}
+          SITE_NEW: ${{ steps.d.outputs.site_new }}
+          SITE_REC: ${{ steps.d.outputs.site_rec }}
+          SITE_DOWN: ${{ steps.d.outputs.site_downmin }}
+          BK_ACT: ${{ steps.d.outputs.backup_act }}
+          BK_DOWN: ${{ steps.d.outputs.backup_downmin }}
+        run: |
+          BODY_FILE=$(mktemp); { cat "$OUT_DIR/summary.md"; echo; echo "실행 기록: $RUN_URL"; } > "$BODY_FILE"
+          open_num() { gh issue list --label "$1" --state open --limit 1 --json number --jq '.[0].number // empty'; }
+          # 사이트(ob-watch)
+          if [ "$SITE_ACT" = alarm ] || [ "$SITE_ACT" = remind ] || [ "$SITE_ACT" = recover ]; then
+            gh label create ob-watch --color B60205 --description "바깥 감시 자동 issue" --force >/dev/null 2>&1 || true
+            NUM=$(open_num ob-watch); T="[바깥 감시] 사이트 점검 실패: $SITE_ACTIVE"
+            case "$SITE_ACT" in
+              alarm)   if [ -z "$NUM" ]; then gh issue create --label ob-watch --title "$T" --body-file "$BODY_FILE"
+                       else gh issue edit "$NUM" --title "$T" --body-file "$BODY_FILE"; gh issue comment "$NUM" --body "새로 3번 이어 실패: $SITE_NEW ($RUN_URL)"; fi ;;
+              remind)  [ -n "$NUM" ] && gh issue edit "$NUM" --title "$T" --body-file "$BODY_FILE" ;;
+              recover) [ -n "$NUM" ] && { gh issue comment "$NUM" --body "회복: $SITE_REC 정상으로 돌아옴. 약 ${SITE_DOWN}분 걸림. ($RUN_URL)"; gh issue close "$NUM"; } ;;
+            esac
+          fi
+          # 백업(ob-watch-backup): 한국 날짜로 하루 한 번만 새 issue
+          if [ "$BK_ACT" = alarm ] || [ "$BK_ACT" = remind ] || [ "$BK_ACT" = recover ]; then
+            gh label create ob-watch-backup --color D93F0B --description "매일 백업 결과 자동 issue" --force >/dev/null 2>&1 || true
+            NUM=$(open_num ob-watch-backup); TODAY=$(TZ=Asia/Seoul date +%F)
+            case "$BK_ACT" in
+              alarm|remind)
+                if [ -n "$NUM" ]; then gh issue edit "$NUM" --body-file "$BODY_FILE"
+                else
+                  N_TODAY=$(gh issue list --label ob-watch-backup --state all --search "created:>=${TODAY}T00:00:00+09:00" --json number --jq 'length')
+                  if [ "${N_TODAY:-0}" = 0 ]; then gh issue create --label ob-watch-backup --title "[바깥 감시] 매일 백업 확인 필요 ($TODAY)" --body-file "$BODY_FILE"
+                  else echo "오늘 백업 issue 를 이미 열었다 닫음 → 새로 열지 않음"; fi
+                fi ;;
+              recover) [ -n "$NUM" ] && { gh issue comment "$NUM" --body "회복: 백업 결과가 정상으로 돌아옴. 약 ${BK_DOWN}분 걸림. ($RUN_URL)"; gh issue close "$NUM"; } ;;
+            esac
+          fi
+
+      - name: 슬랙 알림(웹훅이 있을 때만)
+        if: contains(fromJSON('["alarm","remind","recover"]'), steps.d.outputs.site_act) || contains(fromJSON('["alarm","remind","recover"]'), steps.d.outputs.backup_act)
+        env:
+          OB_SLACK_P1: ${{ secrets.OB_SLACK_P1 }}
+          SITE_ACT: ${{ steps.d.outputs.site_act }}
+          SITE_ACTIVE: ${{ steps.d.outputs.site_active }}
+          SITE_REC: ${{ steps.d.outputs.site_rec }}
+          SITE_DOWN: ${{ steps.d.outputs.site_downmin }}
+          BK_ACT: ${{ steps.d.outputs.backup_act }}
+        run: |
+          [ -n "$OB_SLACK_P1" ] || { echo "슬랙 웹훅 없음 → 건너뜀"; exit 0; }
+          send() { python3 -c 'import json,sys;print(json.dumps({"text": sys.argv[1] + "\n" + sys.argv[2]}))' "$1" "$RUN_URL" > /tmp/slack.json
+                   curl -sS -o /dev/null -w 'slack %{http_code}\n' --max-time 15 -H 'content-type: application/json' --data @/tmp/slack.json "$OB_SLACK_P1" || true; }
+          case "$SITE_ACT" in
+            alarm)   send "[오방도감 바깥 감시] P1 3번 이어 실패: $SITE_ACTIVE";;
+            remind)  send "[오방도감 바깥 감시] 아직 실패 중: $SITE_ACTIVE";;
+            recover) send "[오방도감 바깥 감시] 회복: $SITE_REC (약 ${SITE_DOWN}분)";;
+          esac
+          case "$BK_ACT" in
+            alarm|remind) send "[오방도감 바깥 감시] 매일 백업 확인 필요(36시간 넘게 새 기록 없음 또는 실패)";;
+            recover)      send "[오방도감 바깥 감시] 매일 백업 회복";;
+          esac
+
+      - name: 공개 저장소 60일 멈춤 막기
+        if: github.event_name == 'schedule'
+        run: |
+          LAST=$(git log -1 --format=%ct); AGE=$(( ( $(date +%s) - LAST ) / 86400 ))
+          if [ "$AGE" -ge 45 ]; then
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit --allow-empty -q -m "keepalive"
+            git push -q || true
+          fi
+
+      - name: 판정
+        env:
+          SITE_ACT: ${{ steps.d.outputs.site_act }}
+          BK_ACT: ${{ steps.d.outputs.backup_act }}
+          SITE_ACTIVE: ${{ steps.d.outputs.site_active }}
+          STREAKS: ${{ steps.d.outputs.streaks }}
+        run: |
+          RED=0
+          case "$SITE_ACT" in
+            alarm|remind) echo "::error title=오방도감 바깥 감시::사이트 이어서 실패: $SITE_ACTIVE ($STREAKS)"; RED=1;;
+            ongoing)      echo "::warning title=오방도감 바깥 감시::사이트 아직 실패 중(issue 열려 있음): $SITE_ACTIVE";;
+            warn)         echo "::warning title=오방도감 바깥 감시::한두 번 실패(3번 이어지면 알림): $STREAKS";;
+          esac
+          case "$BK_ACT" in
+            alarm|remind) echo "::error title=오방도감 바깥 감시::매일 백업 확인 필요 ($STREAKS)"; RED=1;;
+            ongoing|warn) echo "::warning title=오방도감 바깥 감시::백업 경고 중 ($STREAKS)";;
+          esac
+          [ "$RED" = 0 ] && echo "사이트 $SITE_ACT · 백업 $BK_ACT"
+          exit $RED
